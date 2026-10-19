@@ -1,0 +1,14 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "2.0",
+  "FriendlyName": "ue_raytracing_lidar_feature",
+  "Category": "Game Features",
+  "EnabledByDefault": true,
+  "CanContainContent": true,
+  "ExplicitlyLoaded": false,
+  "BuiltInInitialFeatureState": "Registered",
+  "SupportedTargetPlatforms": ["Win64", "Linux"],
+  "Modules": [{"Name":"ue_raytracing_lidar_featureRuntime","Type":"Runtime","LoadingPhase":"PostConfigInit"}],
+  "Plugins": [{"Name":"GEMSTAR_Interfaces","Enabled":true},{"Name":"GameFeatures","Enabled":true},{"Name":"ModularGameplay","Enabled":true}]
+}

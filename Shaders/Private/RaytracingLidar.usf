@@ -1,0 +1,185 @@
+/*
+ * Copyright (c) 2026 DLR e.V.
+ *
+ * This program and the accompanying materials are made
+ * available under the terms of the Eclipse Public License 2.0
+ * which is available at https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/SceneData.ush"
+#include "/Engine/Private/RayTracing/RayTracingCommon.ush"
+#include "/Engine/Private/RayTracing/TraceRayInline.ush"
+
+struct RayDefinition
+{
+    float3 LocalDirection;
+    float NormalizedTime;
+    uint Channel;
+    uint OutputIndex;
+};
+struct ObjectMetadata
+{
+    uint ComponentId;
+    uint Segment;
+    uint ObjectLow;
+    uint ObjectHigh;
+    uint ProfileIndex;
+    uint SemanticClass;
+    uint Padding0;
+    uint Padding1;
+};
+struct MaterialProfile
+{
+    uint ProfileId;
+    float Reflectivity;
+    float RetroReflectivity;
+    float Roughness;
+    float SpecularResponse;
+    float Transmission;
+    float Absorption;
+    float WavelengthResponse;
+};
+struct HitResult
+{
+    float3 PositionCm;
+    float RangeMeters;
+    float3 Normal;
+    float Intensity;
+    uint ObjectLow;
+    uint ObjectHigh;
+    uint ProfileId;
+    uint Channel;
+    uint OutputIndex;
+    float TimeOffset;
+    uint Valid;
+    uint SemanticClass;
+    float3 LocalDirection;
+    float Padding;
+};
+RaytracingAccelerationStructure TLAS;
+StructuredBuffer<FRayTracingSceneMetadataRecord> RayTracingSceneMetadata;
+StructuredBuffer<RayDefinition> Rays;
+StructuredBuffer<ObjectMetadata> Metadata;
+StructuredBuffer<MaterialProfile> Profiles;
+RWStructuredBuffer<HitResult> Results;
+float3 Origin;
+float3 LinearVelocity;
+float3 AngularVelocity;
+float4 Rotation;
+float MinRangeCm;
+float MaxRangeCm;
+float Duration;
+float TimeOrigin;
+float NoiseStdDev;
+uint MotionEnabled;
+uint MaterialEnabled;
+uint RayCount;
+uint MetadataCount;
+uint RandomSeed;
+uint PatternKind;
+float2 PatternFrequency;
+float2 PatternPhase;
+float2 PatternFov;
+
+float3 Rotate(float4 Q, float3 V)
+{
+    return V + 2 * cross(Q.xyz, cross(Q.xyz, V) + Q.w * V);
+}
+uint Hash(uint X)
+{
+    X ^= X >> 16;
+    X *= 0x7feb352d;
+    X ^= X >> 15;
+    X *= 0x846ca68b;
+    return X ^ (X >> 16);
+}
+float Uniform(uint X)
+{
+    return (float(Hash(X) >> 8) + 0.5) / 16777216.0;
+}
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 Thread : SV_DispatchThreadID)
+{
+    uint I = Thread.x;
+    if (I >= RayCount)
+        return;
+    RayDefinition Def = Rays[I];
+    if (PatternKind == 3)
+    {
+        // Continuous scan-to-scan phase on the GPU; static definition buffer stays resident.
+        float2 Angles =
+            0.5 * PatternFov * sin(PatternPhase + 6.28318530718 * PatternFrequency * Def.NormalizedTime * Duration);
+        Def.LocalDirection = float3(cos(Angles.y) * cos(Angles.x), cos(Angles.y) * sin(Angles.x), sin(Angles.y));
+    }
+    HitResult Out = (HitResult)0;
+    Out.ObjectLow = Out.ObjectHigh = 0xffffffff;
+    Out.Channel = Def.Channel;
+    Out.OutputIndex = Def.OutputIndex;
+    Out.LocalDirection = Def.LocalDirection;
+    Out.TimeOffset = TimeOrigin + Def.NormalizedTime * Duration;
+    // Extrapolate the sensor pose per ray; scene geometry stays frozen for this scan.
+    float T = MotionEnabled ? Out.TimeOffset : 0;
+    float Speed = length(AngularVelocity);
+    float4 Delta = Speed > 1e-8 ? float4(AngularVelocity / Speed * sin(Speed * T * 0.5), cos(Speed * T * 0.5))
+                                : float4(0, 0, 0, 1);
+    RayDesc Ray;
+    Ray.Origin = Origin + LinearVelocity * T;
+    Ray.Direction = normalize(Rotate(Delta, Rotate(Rotation, Def.LocalDirection)));
+    Ray.TMin = MinRangeCm;
+    Ray.TMax = MaxRangeCm;
+    FTraceRayInlineResult Hit = TraceRayInline(TLAS, RAY_FLAG_FORCE_OPAQUE, 0xff, Ray, CreateTraceRayInlineContext());
+    if (Hit.HitT >= 0)
+    {
+        float3 Normal = 0;
+#if PLATFORM_SUPPORTS_INLINE_RAY_TRACING_TRIANGLE_NORMALS
+        Normal = Hit.WorldGeometryNormal;
+#elif PLATFORM_SUPPORTS_INLINE_RAY_TRACING_TRIANGLE_ATTRIBUTES
+        FTriangleBaseAttributes Tri =
+            LoadInlineRayTracingTriangleAttributes(RayTracingSceneMetadata, Hit.InstanceContributionToHitGroupIndex,
+                RAY_TRACING_NUM_SHADER_SLOTS, Hit.GeometryIndex, Hit.PrimitiveIndex);
+        Normal = normalize(
+            mul(cross(Tri.LocalPositions[1] - Tri.LocalPositions[0], Tri.LocalPositions[2] - Tri.LocalPositions[0]),
+                (float3x3)Hit.WorldToObject3x4));
+#endif
+        FInstanceSceneData Instance = GetInstanceSceneData(Hit.InstanceID);
+        FPrimitiveSceneData Primitive = GetPrimitiveData(Instance.PrimitiveId);
+        uint Component = Primitive.PrimitiveComponentId;
+        uint Low = 0, High = MetadataCount;
+        while (Low < High)
+        {
+            uint Mid = (Low + High) / 2;
+            ObjectMetadata M = Metadata[Mid];
+            if (M.ComponentId < Component || (M.ComponentId == Component && M.Segment < Hit.GeometryIndex))
+                Low = Mid + 1;
+            else
+                High = Mid;
+        }
+        uint ProfileIndex = 0;
+        if (Low < MetadataCount && Metadata[Low].ComponentId == Component && Metadata[Low].Segment == Hit.GeometryIndex)
+        {
+            ObjectMetadata M = Metadata[Low];
+            Out.ObjectLow = M.ObjectLow;
+            Out.ObjectHigh = M.ObjectHigh;
+            ProfileIndex = M.ProfileIndex;
+            Out.SemanticClass = M.SemanticClass;
+        }
+        MaterialProfile P = Profiles[MaterialEnabled ? ProfileIndex : 0];
+        float Range = Hit.HitT * 0.01;
+        float Incidence = abs(dot(Normal, -Ray.Direction));
+        Out.Intensity = (P.Reflectivity * Incidence + P.RetroReflectivity * pow(Incidence, 8)) * P.WavelengthResponse /
+                        max(Range * Range, 0.0001);
+        uint Seed = Hash(RandomSeed ^ Hash(Def.OutputIndex));
+        Range += NoiseStdDev * sqrt(-2 * log(Uniform(Seed))) * cos(6.2831853 * Uniform(Seed + 1));
+        Out.RangeMeters = Range;
+        Out.Normal = Normal;
+        Out.ProfileId = Profiles[ProfileIndex].ProfileId;
+        // Position is relative to the scan-start sensor origin, avoiding float world-coordinate precision loss.
+        Out.PositionCm = LinearVelocity * T + Ray.Direction * (Range * 100);
+        Out.Valid = Range * 100 >= MinRangeCm && Range * 100 <= MaxRangeCm && dot(Normal, Normal) > 0.5;
+    }
+    Results[Def.OutputIndex] = Out;
+}
