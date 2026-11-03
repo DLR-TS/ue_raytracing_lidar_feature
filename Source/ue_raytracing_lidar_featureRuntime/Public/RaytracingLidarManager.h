@@ -12,7 +12,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 
-#include "GEMSTARManager.h"
+#include "GemstarManager.h"
 #include "Utils/GemstarInnerConfig.h"
 #include "Interfaces/Weather/WeatherDataUpdate.h"
 
